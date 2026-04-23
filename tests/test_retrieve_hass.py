@@ -324,6 +324,74 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.rh.df_final[actual_pv_sensor].isna().sum(), 0)
         self.assertEqual(self.rh.df_final[forecast_pv_sensor].isna().sum(), 0)
 
+    def test_evaluate_influx_expression_success(self):
+        idx = pd.date_range("2023-04-01", periods=2, freq="30min", tz="UTC")
+        series_mapping = {
+            "_v0": pd.Series([10.0, 12.0], index=idx),
+            "_v1": pd.Series([1.0, 2.0], index=idx),
+        }
+
+        result = self.rh._evaluate_influx_expression("_v0 - _v1 * 2", series_mapping)
+
+        self.assertIsInstance(result, pd.Series)
+        self.assertTrue(np.allclose(result.values, np.array([8.0, 8.0])))
+
+    def test_evaluate_influx_expression_raises_on_unknown_token(self):
+        idx = pd.date_range("2023-04-01", periods=2, freq="30min", tz="UTC")
+        series_mapping = {"_v0": pd.Series([10.0, 12.0], index=idx)}
+
+        with self.assertRaises(ValueError):
+            self.rh._evaluate_influx_expression("_v0 + _v1", series_mapping)
+
+    def test_get_data_influxdb_expression_success(self):
+        days_list = pd.date_range("2023-04-01", periods=1, freq="D", tz="UTC")
+        expression = "{{'sensor.power_a' - 'sensor.power_b' * 1000}}"
+        var_list = ["sensor.power_a", expression]
+        idx = pd.date_range("2023-04-01T00:00:00Z", periods=2, freq="30min")
+
+        df_a = pd.DataFrame({"sensor.power_a": [2.0, 3.0]}, index=idx)
+        df_b = pd.DataFrame({"sensor.power_b": [0.001, 0.002]}, index=idx)
+        fake_client = MagicMock()
+
+        def fetch_side_effect(client, sensor, start_time, end_time):
+            if sensor == "sensor.power_a":
+                return df_a
+            if sensor == "sensor.power_b":
+                return df_b
+            return None
+
+        with (
+            patch.object(self.rh, "_init_influx_client", return_value=fake_client),
+            patch.object(self.rh, "_fetch_sensor_data", side_effect=fetch_side_effect),
+        ):
+            success = self.rh.get_data_influxdb(days_list, var_list)
+
+        self.assertTrue(success)
+        self.assertIn(expression, self.rh.df_final.columns)
+        self.assertTrue(np.allclose(self.rh.df_final[expression].dropna().values, np.array([1.0, 1.0])))
+        fake_client.close.assert_called_once()
+
+    def test_get_data_influxdb_expression_failure_returns_false(self):
+        days_list = pd.date_range("2023-04-01", periods=1, freq="D", tz="UTC")
+        var_list = ["{{'sensor.power_a' + 'sensor.power_missing'}}"]
+        idx = pd.date_range("2023-04-01T00:00:00Z", periods=2, freq="30min")
+        df_a = pd.DataFrame({"sensor.power_a": [2.0, 3.0]}, index=idx)
+        fake_client = MagicMock()
+
+        def fetch_side_effect(client, sensor, start_time, end_time):
+            if sensor == "sensor.power_a":
+                return df_a
+            return None
+
+        with (
+            patch.object(self.rh, "_init_influx_client", return_value=fake_client),
+            patch.object(self.rh, "_fetch_sensor_data", side_effect=fetch_side_effect),
+        ):
+            success = self.rh.get_data_influxdb(days_list, var_list)
+
+        self.assertFalse(success)
+        fake_client.close.assert_called_once()
+
     # Proposed new test method for InfluxDB
     @patch("influxdb.InfluxDBClient", autospec=True)
     async def test_get_data_influxdb_mock(self, mock_influx_client_class):
